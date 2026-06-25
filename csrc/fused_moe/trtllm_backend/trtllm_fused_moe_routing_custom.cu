@@ -26,6 +26,7 @@
 //   6. routingIndicesHistogramKernel  — histogram from packed TopK (defined in RoutingKernel.cuh)
 //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 
@@ -722,25 +723,22 @@ void launchClusterKernel(Data const& data, void* stream) {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename KernelParams>
-__global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelParams::MaxNumExperts
-                                                                      : 1024)
+template <typename KernelParams, int NumThreadsBlock>
+__global__ void __launch_bounds__(NumThreadsBlock)
     routingIndicesHistogramScoresKernel(KernelParams params) {
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
   using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
-  // Cap actual thread count at 1024 when MaxNumExperts > 1024.
-  static constexpr int NumThreadsBlock =
-      KernelParams::MaxNumExperts <= 1024 ? KernelParams::MaxNumExperts : 1024;
 
-  // VecSize stays based on MaxNumExperts — each warp still processes all experts for one token.
+  static_assert(NumThreadsBlock % WarpSize == 0,
+                "HistogramScores block size must be warp-aligned");
+  static constexpr int NumWarpsBlock = NumThreadsBlock / WarpSize;
   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
 
   int32_t const laneIdx = cutlass::arch::LaneId();
   int32_t const warpIdx = threadIdx.x / WarpSize;
-  // Use NumThreadsBlock (actual thread count) for grid-stride warp/thread addressing
-  int32_t const globalWarpIdx = blockIdx.x * NumThreadsBlock / WarpSize + warpIdx;
-  int32_t const globalWarpStride = gridDim.x * NumThreadsBlock / WarpSize;
+  int32_t const globalWarpIdx = blockIdx.x * NumWarpsBlock + warpIdx;
+  int32_t const globalWarpStride = gridDim.x * NumWarpsBlock;
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WarpSize>(block);
 
@@ -791,12 +789,107 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 #endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
-void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist,
+constexpr int kHistogramScoresLowSpillKernelBlockDim = 256;
+
+template <typename KernelParamsT, int NumThreadsBlock>
+void launchHistogramScoresKernelInstance(Data const& data, uint32_t numBlocks, void* stream) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = numBlocks;
+  config.blockDim = NumThreadsBlock;
+  config.dynamicSmemBytes = 0;
+  config.stream = (cudaStream_t)stream;
+
+  cudaLaunchAttribute attributes[2] = {};
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attributes[0].val.programmaticStreamSerializationAllowed = int(data.mUsePdl);
+  attributes[1].id = cudaLaunchAttributeCooperative;
+  attributes[1].val.cooperative = 0;
+  config.attrs = attributes;
+  config.numAttrs = 2;
+
+  auto params = KernelParamsT::setKernelParams(data);
+  auto kernelTyped = routingIndicesHistogramScoresKernel<KernelParamsT, NumThreadsBlock>;
+  CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));
+}
+
+template <int NumThreadsBlock, typename PreProc, typename PostProc, int MaxNumExperts_,
+          int MaxNumTopExperts_>
+void launchHistogramScoresKernelWithPolicies(Data const& data, uint32_t numBlocks, void* stream) {
+  using ExpertSelect = TopKExpertSelect<PreProc, PostProc>;
+  if (data.mDtypeOutput == tg::Dtype::Fp32) {
+    using ParamsT = KernelParams<float, float, MaxNumExperts_, MaxNumTopExperts_, ExpertSelect>;
+    launchHistogramScoresKernelInstance<ParamsT, NumThreadsBlock>(data, numBlocks, stream);
+  } else if (data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mDtypeInput == tg::Dtype::Fp32) {
+    using ParamsT =
+        KernelParams<float, __nv_bfloat16, MaxNumExperts_, MaxNumTopExperts_, ExpertSelect>;
+    launchHistogramScoresKernelInstance<ParamsT, NumThreadsBlock>(data, numBlocks, stream);
+  } else if (data.mDtypeOutput == tg::Dtype::Bfloat16) {
+    using ParamsT = KernelParams<__nv_bfloat16, __nv_bfloat16, MaxNumExperts_, MaxNumTopExperts_,
+                                 ExpertSelect>;
+    launchHistogramScoresKernelInstance<ParamsT, NumThreadsBlock>(data, numBlocks, stream);
+  } else {
+    FLASHINFER_WARN("Unsupported dtypeOutput");
+  }
+}
+
+template <int NumThreadsBlock, typename PreProc, typename PostProc, int MaxNumExperts_,
+          int MaxNumTopExperts_>
+void launchHistogramScoresKernelForBlockDim(Data const& data, uint32_t maxNumBlocks, void* stream) {
+  static constexpr uint32_t NumWarpsBlock = NumThreadsBlock / WarpSize;
+  uint32_t const tokenBlocks =
+      (static_cast<uint32_t>(data.mNumTokens) + NumWarpsBlock - 1) / NumWarpsBlock;
+  uint32_t const numBlocks = std::max(1u, std::min(maxNumBlocks, tokenBlocks));
+  launchHistogramScoresKernelWithPolicies<NumThreadsBlock, PreProc, PostProc, MaxNumExperts_,
+                                          MaxNumTopExperts_>(data, numBlocks, stream);
+}
+
+void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks,
+                                 uint32_t maxNumBlocksLowSpill, bool useLowSpillBlockDim,
                                  void* stream) {
-  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesHistogramScoresKernel, maxNumBlocks,
-                        numThreadsHist,
-                        /*smemSize=*/0,  // No dynamic smem
-                        stream);
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* policyName_) {
+    using PreProc_ = decltype(preProc_);
+    using PostProc_ = decltype(postProc_);
+    using Pairs_ = typename PolicyTraits<PreProc_, PostProc_>::Pairs;
+    bool dispatched_ =
+        dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {
+          static constexpr int MaxNumExperts_ = decltype(eTag_)::value;
+          static constexpr int MaxNumTopExperts_ = decltype(kTag_)::value;
+          static constexpr int DefaultBlockDim =
+              MaxNumExperts_ <= 1024 ? MaxNumExperts_ : 1024;
+          if (useLowSpillBlockDim) {
+            launchHistogramScoresKernelForBlockDim<kHistogramScoresLowSpillKernelBlockDim,
+                                                   PreProc_, PostProc_, MaxNumExperts_,
+                                                   MaxNumTopExperts_>(
+                data, maxNumBlocksLowSpill, stream);
+          } else {
+            launchHistogramScoresKernelForBlockDim<DefaultBlockDim, PreProc_, PostProc_,
+                                                   MaxNumExperts_, MaxNumTopExperts_>(
+                data, maxNumBlocks, stream);
+          }
+        });
+    if (!dispatched_) {
+      FLASHINFER_WARN(
+          "No compiled tier covers numExperts=%d topK=%d for policy %s in "
+          "launchHistogramScoresKernel.",
+          data.mNumExperts, data.mTopK, policyName_);
+    }
+  });
+}
+
+bool selectsNoOpSoftmax2048x32Tier(Data const& data) {
+  if (data.mPreprocessType != RoutingPreprocessType::None ||
+      data.mPostprocessType != RoutingPostprocessType::Softmax) {
+    return false;
+  }
+
+  using Pairs = typename PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>::Pairs;
+  bool result = false;
+  bool const dispatched =
+      dispatchTierPairs(static_cast<Pairs*>(nullptr), data, [&](auto eTag, auto kTag) {
+        result = decltype(eTag)::value == MaxSupportedExperts &&
+                 decltype(kTag)::value == MaxSupportedTopExperts;
+      });
+  return dispatched && result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1202,6 +1295,11 @@ void run(Data const& data, void* stream) {
   //     "0" / "off"         → force the fused single-cluster kernel for small
   //                           BS, and HistogramScoresKernel (warp-per-token)
   //                           for large BS
+  //   `FLASHINFER_ROUTING_FORCE_TOPK_KERNEL`
+  //     unset / "auto"      → use production heuristics
+  //     "block_scores"      → force the block-per-token scores kernel
+  //     "old_histogram"     → force the original 1024-thread HistogramScores kernel
+  //     "new_histogram"     → force the 256-thread no-spill HistogramScores kernel
   //   Read once per process via a static local; invalid values silently fall
   //   back to "auto".
   enum class ForceMode { kAuto, kOn, kOff };
@@ -1213,24 +1311,45 @@ void run(Data const& data, void* stream) {
     if (v == "0" || v == "off" || v == "OFF") return ForceMode::kOff;
     return ForceMode::kAuto;
   }();
+  enum class TopKKernelMode { kAuto, kBlockScores, kOldHistogram, kNewHistogram };
+  static TopKKernelMode const topKKernelMode = [] {
+    char const* raw = std::getenv("FLASHINFER_ROUTING_FORCE_TOPK_KERNEL");
+    if (raw == nullptr) return TopKKernelMode::kAuto;
+    std::string v = raw;
+    if (v == "block_scores" || v == "blockscore" || v == "block") {
+      return TopKKernelMode::kBlockScores;
+    }
+    if (v == "old_histogram" || v == "histogram" || v == "histogram_scores" ||
+        v == "old_histogram_scores") {
+      return TopKKernelMode::kOldHistogram;
+    }
+    if (v == "new_histogram" || v == "no_spill" || v == "histogram_no_spill" ||
+        v == "new_histogram_scores") {
+      return TopKKernelMode::kNewHistogram;
+    }
+    return TopKKernelMode::kAuto;
+  }();
 
   // Does the currently-active policy pair implement the block-per-token
   // interface?  Queried via PolicyPairSupportsBlockPerToken — policies that
   // don't opt in (no applyToSmem / applyWithAux specialisation) will force
   // this branch to false and fall back to the fused single-cluster kernel.
   bool const policySupportsBlockPerToken = queryPolicySupportsBlockPerToken(data);
-  if (forceMode == ForceMode::kOn && !policySupportsBlockPerToken) {
+  if ((forceMode == ForceMode::kOn || topKKernelMode == TopKKernelMode::kBlockScores) &&
+      !policySupportsBlockPerToken) {
     FLASHINFER_WARN(
-        "FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN is set but the active routing policy does not "
+        "The requested block-per-token routing path is set but the active routing policy does not "
         "support block-per-token; the request is ignored.");
   }
 
   bool useSplitTopKPath = useSingleCluster && !useSingleBlock && policySupportsBlockPerToken &&
                           (data.mNumExperts >= NumExperts160Experts);
-  if (forceMode == ForceMode::kOn && useSingleCluster && !useSingleBlock &&
-      policySupportsBlockPerToken) {
+  if ((forceMode == ForceMode::kOn || topKKernelMode == TopKKernelMode::kBlockScores) &&
+      useSingleCluster && !useSingleBlock && policySupportsBlockPerToken) {
     useSplitTopKPath = true;
-  } else if (forceMode == ForceMode::kOff) {
+  } else if (forceMode == ForceMode::kOff ||
+             topKKernelMode == TopKKernelMode::kOldHistogram ||
+             topKKernelMode == TopKKernelMode::kNewHistogram) {
     useSplitTopKPath = false;
   }
   if (!useSingleCluster && !useSingleBlock) {
@@ -1298,6 +1417,8 @@ void run(Data const& data, void* stream) {
     launchClusterKernel(mutableData, stream);
   } else {
     uint32_t const maxNumBlocks = 1024;
+    uint32_t const maxNumBlocksLowSpill = 4096;
+    bool const isNoSpillHistogramTarget = selectsNoOpSoftmax2048x32Tier(data);
 
     // TopK kernel selection for the large-BS path.
     //
@@ -1318,29 +1439,47 @@ void run(Data const& data, void* stream) {
     // vs ~128 blocks for warp-per-token.  Above BS ≈ 1024 block-per-token
     // starts oversubscribing SMs and loses to the warp-per-token layout.
     //
-    // Dispatch rule (derived from the same sweep as the cluster path):
+    // Dispatch rule:
     //
-    //   useBlockScores = (E >= NumExperts1024Experts)
-    //                 || (E >= NumExperts256Experts && BS <= 1024)
+    //   useBlockScores = !useNoSpillHistogram && E >= 256 && BS <= 1024
     //
-    // The E=1024/K=32 tier is a special corner: block-per-token wins at
-    // every BS (1.95×–5.17×) because fused warp-per-token topK explodes on
-    // register pressure when K=32.  For E ∈ [256, 576], speedups are
-    // 1.01×–1.75× at BS <= 1024 but collapse to 0.77×–1.03× at BS >= 2048,
-    // hence the BS cap.
+    // The block-per-token path is intentionally capped to the small side of
+    // the large-BS range.  It avoids the topK register-pressure issue, but its
+    // one-block-per-token launch shape scales poorly once token count grows.
+    // Outside the high-spill special case below, keep the original
+    // warp-per-token histogram path for larger BS until a broader sweep proves
+    // another replacement is profitable.
+    //
+    // The NoOp+Softmax 2048x32 compile-time tier needs the 256-thread no-spill
+    // histogramScores variant.  Spill risk follows the selected tier, not just
+    // the runtime topK: e.g. E=2048,K=24 and E=1024,K=8 still dispatch to the
+    // same MaxNumExperts=2048, MaxNumTopExperts=32 instantiation.  The original
+    // 1024-thread histogramScores kernel spills that tier's K-sized arrays
+    // heavily across dtypes, while block-per-token avoids spills but loses
+    // throughput once its one-block-per-token launch shape dominates.  On B200,
+    // the explicit {block_scores, old_histogram, new_histogram} sweep shows the
+    // no-spill histogram variant wins from BS=512 through BS=16384 for E=1024
+    // and E=2048.
     bool useBlockScoresForTopK =
-        policySupportsBlockPerToken &&
-        ((data.mNumExperts >= NumExperts1024Experts) ||
-         (data.mNumExperts >= NumExperts256Experts && data.mNumTokens <= 1024));
-    if (forceMode == ForceMode::kOn && policySupportsBlockPerToken) {
+        policySupportsBlockPerToken && !isNoSpillHistogramTarget &&
+        data.mNumExperts >= NumExperts256Experts && data.mNumTokens <= 1024;
+    if ((forceMode == ForceMode::kOn || topKKernelMode == TopKKernelMode::kBlockScores) &&
+        policySupportsBlockPerToken) {
       useBlockScoresForTopK = true;
-    } else if (forceMode == ForceMode::kOff) {
+    } else if (forceMode == ForceMode::kOff ||
+               topKKernelMode == TopKKernelMode::kOldHistogram ||
+               topKKernelMode == TopKKernelMode::kNewHistogram) {
       useBlockScoresForTopK = false;
     }
     if (useBlockScoresForTopK) {
       launchBlockScoresKernel(mutableData, stream);
     } else {
-      launchHistogramScoresKernel(mutableData, maxNumBlocks, numThreadsHist, stream);
+      bool const useLowSpillBlockDim =
+          topKKernelMode == TopKKernelMode::kNewHistogram ||
+          (topKKernelMode == TopKKernelMode::kAuto && forceMode == ForceMode::kAuto &&
+           isNoSpillHistogramTarget);
+      launchHistogramScoresKernel(mutableData, maxNumBlocks, maxNumBlocksLowSpill,
+                                  useLowSpillBlockDim, stream);
     }
 
     bool const canUseCoop =
